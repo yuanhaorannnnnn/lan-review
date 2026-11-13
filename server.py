@@ -3,7 +3,7 @@ import base64
 import binascii
 import fcntl
 import hashlib
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from ipaddress import IPv4Address, IPv4Network, ip_address
 import json
@@ -17,16 +17,19 @@ import sqlite3
 import stat
 import subprocess
 import tempfile
+import time
 import threading
 from io import BytesIO
 from unicodedata import normalize
 from urllib.parse import unquote, urlsplit
+from urllib.request import Request, urlopen
 from xml.etree.ElementTree import Element
 
 import bleach
 from flask import Flask, Response, abort, g, jsonify, request, send_file, url_for
 from markdown import Markdown
 from markdown.treeprocessors import Treeprocessor
+from pygments.token import STANDARD_TYPES
 from werkzeug.exceptions import HTTPException
 from werkzeug.serving import make_server
 
@@ -42,6 +45,11 @@ FILE_TYPES = {
     ".webp": ("image", "image/webp"),
     ".gif": ("image", "image/gif"),
     ".avif": ("image", "image/avif"),
+    ".mp3": ("audio", "audio/mpeg"),
+    ".wav": ("audio", "audio/wav"),
+    ".m4a": ("audio", "audio/mp4"),
+    ".ogg": ("audio", "audio/ogg"),
+    ".flac": ("audio", "audio/flac"),
     ".mp4": ("video", "video/mp4"),
     ".m4v": ("video", "video/mp4"),
     ".webm": ("video", "video/webm"),
@@ -330,6 +338,30 @@ CREATE TABLE IF NOT EXISTS reviews (
     mimetype TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS removed_reviews (
+    review_id TEXT PRIMARY KEY REFERENCES reviews (id)
+);
+CREATE TABLE IF NOT EXISTS review_origins (
+    review_id TEXT PRIMARY KEY REFERENCES reviews (id),
+    remote INTEGER NOT NULL CHECK (remote IN (0, 1))
+);
+CREATE TABLE IF NOT EXISTS public_reviews (
+    review_id TEXT PRIMARY KEY REFERENCES reviews (id)
+);
+CREATE TABLE IF NOT EXISTS review_participants (
+    id INTEGER PRIMARY KEY,
+    review_id TEXT NOT NULL REFERENCES reviews(id),
+    name TEXT NOT NULL,
+    owner_hash TEXT,
+    UNIQUE(review_id, name),
+    UNIQUE(review_id, owner_hash)
+);
+CREATE TABLE IF NOT EXISTS visitor_profiles (
+    owner_hash TEXT PRIMARY KEY,
+    alias TEXT NOT NULL,
+    display_name TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS profiles_by_alias ON visitor_profiles(alias);
 CREATE TABLE IF NOT EXISTS comments (
     id INTEGER PRIMARY KEY,
     review_id TEXT NOT NULL REFERENCES reviews (id),
@@ -448,8 +480,8 @@ def render_markdown(source, attachments):
             metadata = front[1].rstrip("\n")
             source = source[front.end():]
     renderer = Markdown(
-        extensions=["fenced_code", "tables", "sane_lists", "toc"],
-        extension_configs={"tables": {"use_align_attribute": True}},
+        extensions=["tables", "sane_lists", "toc", "footnotes", "pymdownx.superfences", "pymdownx.highlight", "pymdownx.tilde", "pymdownx.mark", "pymdownx.arithmatex"],
+        extension_configs={"tables": {"use_align_attribute": True}, "pymdownx.arithmatex": {"generic": True}, "pymdownx.tilde": {"subscript": False}, "pymdownx.highlight": {"guess_lang": False}},
     )
     renderer.preprocessors.deregister("html_block")
     renderer.inlinePatterns.deregister("html")
@@ -460,7 +492,7 @@ def render_markdown(source, attachments):
         if tag == "a":
             if name == "href":
                 return value.startswith("#") or external_http_link(value)
-            return (name, value) in {("rel", "noopener noreferrer"), ("target", "_blank")}
+            return (name, value) in {("rel", "noopener noreferrer"), ("target", "_blank"), ("class", "footnote-ref"), ("class", "footnote-backref")} or (name == "title" and len(value) <= 200)
         if tag == "img" and name == "src":
             return value in asset_urls or bool(BITMAP_DATA_URL.match(value))
         if tag == "input":
@@ -468,7 +500,11 @@ def render_markdown(source, attachments):
                 name in {"disabled", "checked"} and value == name
             )
         if tag == "span":
-            return name == "class" and value == "missing-image"
+            return name == "class" and (value in {"missing-image", "arithmatex"} or value in STANDARD_TYPES.values())
+        if tag == "div":
+            return name == "class" and value in {"arithmatex", "highlight", "footnote"}
+        if tag in {"sup", "li"} and name == "id":
+            return bool(re.fullmatch(r"fn(?:ref)?[0-9]*:[\w.:-]{1,128}", value))
         if tag == "ol":
             return name == "start" and value.isascii() and value.isdecimal()
         return (tag, name) in {("img", "alt"), ("img", "title"), ("th", "align"), ("td", "align")} or (
@@ -478,8 +514,8 @@ def render_markdown(source, attachments):
     html = bleach.clean(
         renderer.convert(source),
         tags={
-            "a", "blockquote", "br", "code", "em", "h1", "h2", "h3", "h4", "h5", "h6",
-            "hr", "img", "input", "li", "ol", "p", "pre", "span", "strong", "table", "tbody", "td", "th",
+            "a", "blockquote", "br", "code", "del", "div", "em", "h1", "h2", "h3", "h4", "h5", "h6",
+            "hr", "img", "input", "li", "mark", "ol", "p", "pre", "span", "strong", "sup", "table", "tbody", "td", "th",
             "thead", "tr", "ul",
         },
         attributes=allow_attribute,
@@ -500,7 +536,7 @@ def markdown_local_images(source):
                 if not BITMAP_DATA_URL.match(raw):
                     found.append((raw, markdown_image_reference(raw)))
 
-    renderer = Markdown(extensions=["fenced_code", "tables", "sane_lists", "toc"])
+    renderer = Markdown(extensions=["pymdownx.superfences", "tables", "sane_lists", "toc"])
     renderer.preprocessors.deregister("html_block")
     renderer.inlinePatterns.deregister("html")
     renderer.treeprocessors.register(CollectImages(renderer), "collect-images", 15)
@@ -611,7 +647,7 @@ def validate_anchor(anchor, review_type):
         if "region" in anchor:
             return {"type": "image", "region": validate_region(anchor["region"])}
         keys, upper = ("x", "y"), 1
-    elif anchor_type == "video" and review_type == "video":
+    elif anchor_type in ("video", "audio") and review_type == anchor_type:
         keys, upper = ("time",), 10**9
     else:
         abort(400, "评论定位与文件类型不匹配。")
@@ -621,7 +657,7 @@ def validate_anchor(anchor, review_type):
         if type(value) not in (int, float) or not 0 <= value <= upper or not math.isfinite(value):
             abort(400, "评论定位数值无效。")
         result[key] = value
-    if anchor_type == "video" and "end_time" in anchor:
+    if anchor_type in ("video", "audio") and "end_time" in anchor:
         end_time = anchor["end_time"]
         if (type(end_time) not in (int, float) or not result["time"] < end_time <= 10**9
                 or not math.isfinite(end_time)):
@@ -661,7 +697,7 @@ def persistent_owner_token(data_dir):
         os.close(fd)
 
 
-def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None):
+def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None, public_origin=None):
     if (lan_ip is None) != (lan_cidr is None):
         raise ValueError("--lan-ip 和 --lan-cidr 必须同时设置。")
     network = None
@@ -673,13 +709,23 @@ def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None
     if not 1 <= port <= 65535:
         raise ValueError("端口须为 1 至 65535。")
 
+    public_host = None
+    if public_origin:
+        parsed = urlsplit(public_origin)
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+                or parsed.path not in ("", "/") or parsed.query or parsed.fragment or parsed.port not in (None, 443)
+                or not re.fullmatch(r"[A-Za-z0-9.-]+", parsed.hostname)):
+            raise ValueError("外链地址必须是 HTTPS 域名。")
+        public_host = parsed.hostname.lower()
+        public_origin = "https://" + public_host
+
     data_dir = Path(data_dir).expanduser().resolve()
     data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     app = Flask(__name__)
     app.config.update(
         MAX_CONTENT_LENGTH=MAX_UPLOAD_BYTES + 65536,
         MAX_FORM_PARTS=MAX_ATTACHMENTS + 5,
-        TRUSTED_HOSTS=["localhost", "127.0.0.1"] + ([str(lan_ip)] if lan_ip else []),
+        TRUSTED_HOSTS=["localhost", "127.0.0.1"] + ([str(lan_ip)] if lan_ip else []) + ([public_host] if public_host else []),
     )
     share_origin = f"http://{lan_ip}:{port}" if lan_ip else ""
     media_dir = data_dir / "files"
@@ -687,6 +733,10 @@ def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None
     database = data_dir / "reviews.sqlite3"
     picker_lock = threading.Lock()
     segment_lock = threading.BoundedSemaphore(1)
+    upload_lock = threading.RLock()
+    uploads = {}
+    presence_lock = threading.Lock()
+    presence = {}
 
     def connect():
         connection = sqlite3.connect(database, timeout=15)
@@ -699,11 +749,90 @@ def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None
         connection.executescript(SCHEMA)
         if "anonymous" not in {row["name"] for row in connection.execute("PRAGMA table_info(comment_requests)")}:
             connection.execute("ALTER TABLE comment_requests ADD COLUMN anonymous INTEGER NOT NULL DEFAULT 0")
+        if "removed_at" not in {row["name"] for row in connection.execute("PRAGMA table_info(removed_reviews)")} :
+            connection.execute("ALTER TABLE removed_reviews ADD COLUMN removed_at TEXT")
+        if "initiator" not in {row["name"] for row in connection.execute("PRAGMA table_info(review_origins)")}:
+            connection.execute("ALTER TABLE review_origins ADD COLUMN initiator TEXT")
         comment_columns = {row["name"] for row in connection.execute("PRAGMA table_info(comments)")}
         if "owner_hash" not in comment_columns:
             connection.execute("ALTER TABLE comments ADD COLUMN owner_hash TEXT")
         if "deleted" not in comment_columns:
             connection.execute("ALTER TABLE comments ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
+        if "kind" not in comment_columns:
+            connection.execute("ALTER TABLE comments ADD COLUMN kind TEXT NOT NULL DEFAULT 'comment'")
+        connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_completion_per_visitor ON comments(review_id, owner_hash) WHERE kind = 'review_complete'")
+
+    def upload_check():
+        job = getattr(g, "upload_job", None)
+        if job:
+            with upload_lock:
+                if job["state"] in ("cancelling", "cancelled"):
+                    abort(409, "上传已取消。")
+
+    @contextmanager
+    def upload_commit():
+        with upload_lock:
+            upload_check()
+            yield
+            job = getattr(g, "upload_job", None)
+            if job:
+                job["state"] = "completed"
+
+    @app.post("/api/uploads")
+    def begin_upload():
+        token = secrets.token_urlsafe(24)
+        with upload_lock:
+            now = time.monotonic()
+            for key, item in list(uploads.items()):
+                if item["state"] in ("cancelled", "completed", "failed") and now - item["updated"] > 3600:
+                    del uploads[key]
+            uploads[token] = {"state": "waiting", "updated": now}
+        return jsonify(id=token), 201
+
+    @app.post("/api/uploads/<token>/cancel")
+    def cancel_upload(token):
+        with upload_lock:
+            job = uploads.get(token)
+            if job is None:
+                abort(404, "上传任务不存在。")
+            if job["state"] in ("waiting", "failed"):
+                job["state"] = "cancelled"
+            elif job["state"] == "active":
+                job["state"] = "cancelling"
+            job["updated"] = time.monotonic()
+            return jsonify(state=job["state"])
+
+    @app.get("/api/uploads/<token>")
+    def upload_status(token):
+        with upload_lock:
+            job = uploads.get(token)
+            if job is None:
+                abort(404, "上传任务不存在。")
+            return jsonify(state=job["state"])
+
+    def attach_upload():
+        if request.method != "POST" or request.path not in ("/api/reviews", "/api/reviews/bundle"):
+            return
+        token = request.headers.get("X-Upload-Id")
+        if token is None:
+            return
+        with upload_lock:
+            job = uploads.get(token)
+            if job is None or job["state"] != "waiting":
+                abort(409, "上传任务已结束或不存在。")
+            job["state"] = "active"
+            g.upload_job = job
+
+    @app.teardown_request
+    def finish_upload(error):
+        job = getattr(g, "upload_job", None)
+        if job:
+            with upload_lock:
+                if job["state"] == "cancelling":
+                    job["state"] = "cancelled"
+                elif job["state"] == "active":
+                    job["state"] = "failed"
+                job["updated"] = time.monotonic()
 
     @app.before_request
     def enforce_network():
@@ -722,12 +851,16 @@ def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None
                 abort(403, "拒绝跨来源提交。")
             if request.headers.get("Sec-Fetch-Site") == "cross-site":
                 abort(403, "拒绝跨来源提交。")
+        attach_upload()
 
     @app.after_request
     def security_headers(response):
         if getattr(g, "new_visitor_id", None) and response.status_code < 400:
             response.set_cookie("lanreview_visitor", g.new_visitor_id, max_age=31536000,
                                 httponly=True, samesite="Lax", path="/")
+        if request.environ.get("lanreview.public") and request.path == "/static/style.css" and response.status_code == 200:
+            response.direct_passthrough = False
+            response.set_data(response.get_data() + b"\n#smart-anchor,.review-back,.author-options .save-author{display:none!important}\n")
         response.headers.setdefault("Content-Security-Policy", APP_CSP)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-DNS-Prefetch-Control"] = "off"
@@ -750,7 +883,7 @@ def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None
         if not SHARE_ID.fullmatch(review_id):
             abort(404, "评审不存在。")
         with closing(connect()) as connection:
-            row = connection.execute("SELECT * FROM reviews WHERE id = ?", (review_id,)).fetchone()
+            row = connection.execute("SELECT reviews.*, COALESCE((SELECT p.display_name FROM visitor_profiles p WHERE p.alias = o.initiator AND p.display_name != '' ORDER BY p.owner_hash LIMIT 1), o.initiator) AS initiator FROM reviews LEFT JOIN review_origins o ON o.review_id = reviews.id WHERE reviews.id = ? AND NOT EXISTS (SELECT 1 FROM removed_reviews WHERE review_id = reviews.id)", (review_id,)).fetchone()
         if row is None:
             abort(404, "评审不存在。")
         return row
@@ -759,10 +892,11 @@ def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None
         return {
             "id": row["id"],
             "name": row["name"],
+            "initiator": row["initiator"] or "未记录",
             "type": row["type"],
             "created_at": row["created_at"],
-            "url": share_origin + url_for("review_page", review_id=row["id"]),
-            "share_scope": "lan" if share_origin else "local",
+            "url": (public_origin if request.environ.get("lanreview.public") else share_origin) + url_for("review_page", review_id=row["id"]),
+            "share_scope": "public" if request.environ.get("lanreview.public") else ("lan" if share_origin else "local"),
         }
 
     @app.get("/")
@@ -774,11 +908,60 @@ def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None
         read_review(review_id)
         return app.send_static_file("index.html")
 
+    def can_create_public_link():
+        return not request.environ.get("lanreview.public") and (g.local_device or (lan_ip is not None and request.remote_addr == str(lan_ip)))
+
     @app.get("/api/reviews")
     def list_reviews():
         with closing(connect()) as connection:
-            rows = connection.execute("SELECT * FROM reviews ORDER BY created_at DESC, rowid DESC")
-            return jsonify(reviews=[review_summary(row) for row in rows])
+            rows = connection.execute("SELECT reviews.*, COALESCE((SELECT p.display_name FROM visitor_profiles p WHERE p.alias = o.initiator AND p.display_name != '' ORDER BY p.owner_hash LIMIT 1), o.initiator) AS initiator FROM reviews LEFT JOIN review_origins o ON o.review_id = reviews.id WHERE NOT EXISTS (SELECT 1 FROM removed_reviews WHERE review_id = reviews.id) ORDER BY reviews.created_at DESC, reviews.rowid DESC")
+            return jsonify(reviews=[review_summary(row) for row in rows], can_create_public_link=can_create_public_link())
+
+    @app.post("/api/reviews/<review_id>/public-link")
+    def create_public_link(review_id):
+        if not can_create_public_link():
+            abort(403, "只能在托管服务的电脑上创建外链。")
+        if not public_origin:
+            abort(503, "外链服务尚未配置。")
+        row = read_review(review_id)
+        if row["type"] in ("video", "audio"):
+            abort(415, "当前免费外链不支持音视频播放，请使用局域网链接。")
+        try:
+            with urlopen(Request(public_origin + "/static/favicon.svg", headers={"User-Agent": "LanReview/1.0"}), timeout=5) as check:
+                if check.status != 200:
+                    abort(503, "外链通道暂不可用，请稍后重试。")
+        except (OSError, ValueError):
+            abort(503, "外链通道暂不可用，请稍后重试。")
+        with closing(connect()) as connection, connection:
+            connection.execute("INSERT OR IGNORE INTO public_reviews (review_id) VALUES (?)", (review_id,))
+        return jsonify(url=public_origin + url_for("review_page", review_id=review_id))
+
+    @app.post("/api/reviews/clear")
+    def clear_reviews():
+        data = request.get_json(silent=True)
+        ids = data.get("ids") if isinstance(data, dict) else None
+        if not isinstance(ids, list) or len(ids) > 5000 or any(not isinstance(i, str) or not SHARE_ID.fullmatch(i) for i in ids):
+            abort(400, "评审列表无效。")
+        with closing(connect()) as connection, connection:
+            before = connection.total_changes
+            now = timestamp()
+            connection.executemany(
+                "INSERT OR IGNORE INTO removed_reviews (review_id, removed_at) SELECT id, ? FROM reviews WHERE id = ?",
+                ((now, review_id) for review_id in set(ids)),
+            )
+            removed = connection.total_changes - before
+        return jsonify(deleted=removed)
+
+    @app.post("/api/reviews/<review_id>/delete")
+    def delete_review(review_id):
+        if not SHARE_ID.fullmatch(review_id):
+            abort(404, "评审不存在。")
+        with closing(connect()) as connection, connection:
+            result = connection.execute(
+                "INSERT OR IGNORE INTO removed_reviews (review_id, removed_at) SELECT id, ? FROM reviews WHERE id = ?", (timestamp(), review_id))
+            if result.rowcount != 1:
+                abort(404, "评审不存在。")
+        return jsonify(deleted=True)
 
     @app.post("/api/reviews/<review_id>/segment")
     def segment_review_frame(review_id):
@@ -879,7 +1062,7 @@ def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None
         if len(set(references)) != len(references) or any(ref not in allowed for ref in references):
             abort(400, "附件引用必须是文档中唯一存在的图片引用。")
         review_id = secrets.token_urlsafe(24)
-        row = dict(id=review_id, name=name, type="markdown", mimetype="text/plain", created_at=timestamp())
+        row = dict(initiator=anonymous_label(visitor_id()), id=review_id, name=name, type="markdown", mimetype="text/plain", created_at=timestamp())
         staged = []
         placed = []
         attached = []
@@ -905,6 +1088,7 @@ def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None
                     staged.append((temporary, media_dir / f"attachment-{image_id}"))
                     size = 0
                     while chunk := upload.stream.read(1024 * 1024):
+                        upload_check()
                         size += len(chunk)
                         if size > remaining:
                             abort(413, "图片附件合计不能超过 512 MiB。")
@@ -917,8 +1101,9 @@ def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None
                 if mimetype is None:
                     abort(415, "未识别出受支持的图片格式。")
                 attached.append((review_id, image_id, "local:" + ref, mimetype))
-            with closing(connect()) as connection, connection:
+            with upload_commit(), closing(connect()) as connection, connection:
                 connection.execute("INSERT INTO reviews VALUES (:id, :name, :type, :mimetype, :created_at)", row)
+                connection.execute("INSERT INTO review_origins (review_id, remote, initiator) VALUES (?, ?, ?)", (review_id, int(not ip_address(request.remote_addr).is_loopback and request.remote_addr != str(lan_ip)), row["initiator"]))
                 connection.executemany("INSERT INTO review_attachments VALUES (?, ?, ?, ?)", attached)
                 for temporary, destination in staged:
                     temporary.replace(destination)
@@ -951,7 +1136,7 @@ def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None
         if len(attachments) > MAX_ATTACHMENTS:
             abort(413, f"图片附件最多 {MAX_ATTACHMENTS} 张。")
         review_id = secrets.token_urlsafe(24)
-        row = dict(id=review_id, name=name, type=review_type, mimetype=mimetype, created_at=timestamp())
+        row = dict(initiator=anonymous_label(visitor_id()), id=review_id, name=name, type=review_type, mimetype=mimetype, created_at=timestamp())
         staged_files = []
         placed_files = []
 
@@ -961,6 +1146,7 @@ def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None
                 staged_files.append((temporary, destination))
                 size = 0
                 while chunk := source.stream.read(1024 * 1024):
+                    upload_check()
                     size += len(chunk)
                     if size > limit:
                         abort(413, oversize)
@@ -1007,10 +1193,11 @@ def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None
                 remaining -= size
                 attached.append((review_id, attachment_id, attachment_name, detect_bitmap(temporary)))
 
-            with closing(connect()) as connection, connection:
+            with upload_commit(), closing(connect()) as connection, connection:
                 connection.execute(
                     "INSERT INTO reviews VALUES (:id, :name, :type, :mimetype, :created_at)", row
                 )
+                connection.execute("INSERT INTO review_origins (review_id, remote, initiator) VALUES (?, ?, ?)", (review_id, int(not ip_address(request.remote_addr).is_loopback and request.remote_addr != str(lan_ip)), row["initiator"]))
                 connection.executemany("INSERT INTO review_attachments VALUES (?, ?, ?, ?)", attached)
                 for temporary, destination in staged_files:
                     temporary.replace(destination)
@@ -1071,7 +1258,7 @@ def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None
             abort(400, "文件名不能超过 255 字。")
         review_type, mimetype = FILE_TYPES[extension]
         review_id = secrets.token_urlsafe(24)
-        row = dict(id=review_id, name=source.name, type=review_type, mimetype=mimetype, created_at=timestamp())
+        row = dict(initiator=anonymous_label(visitor_id()), id=review_id, name=source.name, type=review_type, mimetype=mimetype, created_at=timestamp())
         staged = []
         placed = []
         warnings = []
@@ -1153,6 +1340,7 @@ def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None
 
             with closing(connect()) as connection, connection:
                 connection.execute("INSERT INTO reviews VALUES (:id, :name, :type, :mimetype, :created_at)", row)
+                connection.execute("INSERT INTO review_origins (review_id, remote, initiator) VALUES (?, ?, ?)", (review_id, int(not ip_address(request.remote_addr).is_loopback and request.remote_addr != str(lan_ip)), row["initiator"]))
                 connection.executemany("INSERT INTO review_attachments VALUES (?, ?, ?, ?)", attached)
                 for temporary, destination in staged:
                     temporary.replace(destination)
@@ -1167,7 +1355,7 @@ def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None
         return jsonify(**review_summary(row), warnings=warnings), 201
 
     def visitor_id(key=None):
-        value = request.cookies.get("lanreview_visitor", "")
+        value = getattr(g, "new_visitor_id", None) or request.cookies.get("lanreview_visitor", "")
         if SHARE_ID.fullmatch(value):
             return value
         # A cookie-less retry with the same request key must resolve to the same
@@ -1176,21 +1364,79 @@ def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None
         g.new_visitor_id = value
         return value
 
+    def anonymous_label(value):
+        return "匿名-" + hashlib.sha256(value.encode()).hexdigest()[:10]
+
     def comment_owner(value):
         return hashlib.sha256(("lanreview-comment-owner:" + value).encode()).hexdigest()
+
+    @app.post("/api/reviews/<review_id>/presence")
+    def review_presence(review_id):
+        read_review(review_id)
+        identity = comment_owner(visitor_id())
+        now = time.monotonic()
+        with presence_lock:
+            for rid, viewers in list(presence.items()):
+                for visitor, entry in list(viewers.items()):
+                    if now - entry["seen"] >= 90:
+                        del viewers[visitor]
+                if not viewers:
+                    del presence[rid]
+            viewers = presence.setdefault(review_id, {})
+            scope = "local_or_proxy" if ip_address(request.remote_addr).is_loopback else "lan"
+            viewers[identity] = {"seen": now, "scope": scope}
+            count = len(viewers)
+            lan = sum(entry["scope"] == "lan" for entry in viewers.values())
+        return jsonify(count=count, lan=lan, local_or_proxy=count - lan)
+
+    def save_profile(connection, identity, name):
+        connection.execute(
+            "INSERT INTO visitor_profiles (owner_hash, alias, display_name) VALUES (?, ?, ?) "
+            "ON CONFLICT(owner_hash) DO UPDATE SET display_name = excluded.display_name",
+            (comment_owner(identity), anonymous_label(identity), name),
+        )
+
+    @app.post("/api/profile")
+    def update_profile():
+        request.max_content_length = 4096
+        payload = request.get_json()
+        name = payload.get("name") if isinstance(payload, dict) else None
+        if not isinstance(name, str) or len(name.strip()) > 64:
+            abort(400, "署名不能超过 64 字。")
+        name = name.strip()
+        try:
+            name.encode("utf-8")
+        except UnicodeError:
+            abort(400, "署名包含无效字符。")
+        identity = visitor_id()
+        with closing(connect()) as connection, connection:
+            save_profile(connection, identity, name)
+        return jsonify(name=name)
 
     def public_comment(row, owner, review_id):
         result = dict(row)
         stored_owner = result.pop("owner_hash", None)
+        profile_name = result.pop("profile_name", None)
+        profile_alias = result.pop("profile_alias", None)
+        if profile_name is not None:
+            result["author"] = profile_name or profile_alias
         has_thumbnail = result.pop("has_thumbnail", 0)
         deleted = bool(result.get("deleted"))
         result["deleted"] = deleted
-        result["can_delete"] = bool(stored_owner and owner and secrets.compare_digest(stored_owner, owner) and not deleted)
+        mine = bool(stored_owner and owner and secrets.compare_digest(stored_owner, owner))
+        kind = result.pop("kind", "comment")
+        participant_name = result.pop("participant_name", None)
+        if kind in ("review_complete", "review_complete_history", "review_uncomplete"):
+            if participant_name:
+                result["author"] = participant_name
+            result.update(kind=kind, is_mine=mine)
+        result["can_delete"] = bool(mine and not deleted and kind not in ("review_complete", "review_complete_history", "review_uncomplete"))
         result["thumbnail_url"] = url_for("comment_thumbnail", review_id=review_id, comment_id=result["id"]) if has_thumbnail and not deleted else None
         result["anchor"] = json.loads(result["anchor"])
         if deleted:
             result["author"] = "评论已删除"
             result["body"] = ""
+            result["anchor"] = None
         return result
 
     @app.get("/api/reviews/<review_id>")
@@ -1199,17 +1445,88 @@ def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None
         owner = comment_owner(visitor_id())
         with closing(connect()) as connection:
             rows = connection.execute(
-                "SELECT id, parent_id, author, body, anchor, created_at, owner_hash, deleted, "
-                "EXISTS(SELECT 1 FROM comment_thumbnails t WHERE t.comment_id = comments.id) AS has_thumbnail "
-                "FROM comments WHERE review_id = ? ORDER BY id",
+                "SELECT c.id, c.parent_id, c.author, c.body, c.anchor, c.created_at, c.owner_hash, c.deleted, c.kind, "
+                "p.display_name AS profile_name, p.alias AS profile_alias, "
+                "(SELECT rp.name FROM review_participants rp WHERE rp.review_id = c.review_id AND rp.owner_hash = c.owner_hash) AS participant_name, "
+                "EXISTS(SELECT 1 FROM comment_thumbnails t WHERE t.comment_id = c.id) AS has_thumbnail "
+                "FROM comments c LEFT JOIN visitor_profiles p ON p.owner_hash = c.owner_hash WHERE c.review_id = ? ORDER BY c.id",
                 (review_id,),
             )
             comments = [public_comment(comment, owner, review_id) for comment in rows]
+            participants = [dict(id=p["id"], name=p["name"], completed=bool(p["completed"]), claimed=bool(p["owner_hash"]),
+                                 is_mine=bool(p["owner_hash"] and secrets.compare_digest(p["owner_hash"], owner)))
+                            for p in connection.execute("SELECT rp.id, rp.name, rp.owner_hash, EXISTS(SELECT 1 FROM comments c WHERE c.review_id=rp.review_id AND c.owner_hash=rp.owner_hash AND c.kind='review_complete') AS completed FROM review_participants rp WHERE rp.review_id = ? ORDER BY rp.id", (review_id,))]
         result = review_summary(row)
-        result.update(content_url=url_for("review_media", review_id=review_id), comments=comments)
+        result.update(content_url=url_for("review_media", review_id=review_id), comments=comments, participants=participants,
+                      completed_by_me=any(c.get("kind") == "review_complete" and c.get("is_mine") for c in comments))
         if row["type"] == "markdown":
             result["rendered_url"] = url_for("rendered_review", review_id=review_id)
         return jsonify(result)
+
+    @app.post("/api/reviews/<review_id>/participants")
+    def set_review_participants(review_id):
+        read_review(review_id)
+        request.max_content_length = 8192
+        payload = request.get_json(silent=True)
+        names = payload.get("names") if isinstance(payload, dict) else None
+        if not isinstance(names, list) or len(names) > 50 or any(not isinstance(n, str) or not n.strip() or len(n.strip()) > 64 for n in names):
+            abort(400, "名单须包含不超过 50 个有效名字。")
+        names = [n.strip() for n in names]
+        if len(set(names)) != len(names):
+            abort(400, "名单中不能有重复名字。")
+        with closing(connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = {r["name"]: r["id"] for r in connection.execute("SELECT id, name FROM review_participants WHERE review_id = ?", (review_id,))}
+            for name, participant_id in existing.items():
+                if name not in names:
+                    connection.execute("DELETE FROM review_participants WHERE id = ?", (participant_id,))
+            for name in names:
+                if name not in existing:
+                    connection.execute("INSERT INTO review_participants (review_id, name) VALUES (?, ?)", (review_id, name))
+        return jsonify(ok=True)
+
+    @app.post("/api/reviews/<review_id>/complete")
+    def complete_review(review_id):
+        read_review(review_id)
+        identity = visitor_id()
+        owner = comment_owner(identity)
+        payload = request.get_json(silent=True) or {}
+        participant_id = payload.get("participant_id") if isinstance(payload, dict) else None
+        with closing(connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            participants = list(connection.execute("SELECT id, owner_hash FROM review_participants WHERE review_id = ?", (review_id,)))
+            if participants:
+                mine = next((p for p in participants if p["owner_hash"] == owner), None)
+                if not mine:
+                    selected = next((p for p in participants if type(participant_id) is int and p["id"] == participant_id), None)
+                    if selected is None:
+                        abort(400, "请选择名单中的自己。")
+                    if selected["owner_hash"]:
+                        abort(409, "此评审人已被认领，请选择自己的名字。")
+                    connection.execute("UPDATE review_participants SET owner_hash = ? WHERE id = ?", (owner, selected["id"]))
+            connection.execute(
+                "INSERT OR IGNORE INTO comments (review_id, parent_id, author, body, anchor, created_at, owner_hash, kind) VALUES (?, NULL, ?, ?, ?, ?, ?, 'review_complete')",
+                (review_id, anonymous_label(identity), "已完成评审", "null", timestamp(), owner),
+            )
+        return jsonify(ok=True)
+
+    @app.post("/api/reviews/<review_id>/uncomplete")
+    def uncomplete_review(review_id):
+        read_review(review_id)
+        identity = visitor_id()
+        owner = comment_owner(identity)
+        with closing(connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            changed = connection.execute(
+                "UPDATE comments SET kind = 'review_complete_history' WHERE review_id = ? AND owner_hash = ? AND kind = 'review_complete'",
+                (review_id, owner),
+            ).rowcount
+            if changed:
+                connection.execute(
+                    "INSERT INTO comments (review_id, parent_id, author, body, anchor, created_at, owner_hash, kind) VALUES (?, NULL, ?, ?, ?, ?, ?, 'review_uncomplete')",
+                    (review_id, anonymous_label(identity), "撤销了完成", "null", timestamp(), owner),
+                )
+        return jsonify(ok=True)
 
     @app.post("/api/reviews/<review_id>/comments")
     def add_comment(review_id):
@@ -1231,7 +1548,7 @@ def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None
         owner = comment_owner(identity)
         anonymous = not author
         if anonymous:
-            author = "匿名-" + hashlib.sha256(identity.encode()).hexdigest()[:10]
+            author = anonymous_label(identity)
         try:
             author.encode("utf-8")
             body.encode("utf-8")
@@ -1251,9 +1568,9 @@ def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None
         created_at = timestamp()
         content = {"author": author, "body": body, "anchor": anchor, "parent_id": parent_id}
         with closing(connect()) as connection, connection:
+            # Serialize completion and comment creation while preserving idempotent replay.
+            connection.execute("BEGIN IMMEDIATE")
             if key is not None:
-                # Serialize the replay check with the insert across concurrent requests.
-                connection.execute("BEGIN IMMEDIATE")
                 existing = connection.execute(
                     """
                     SELECT c.id, c.author, c.body, c.anchor, c.parent_id, c.created_at, c.owner_hash, c.deleted,
@@ -1283,6 +1600,8 @@ def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None
                     stored["can_delete"] = bool(stored_owner and secrets.compare_digest(stored_owner, owner))
                     stored["thumbnail_url"] = url_for("comment_thumbnail", review_id=review_id, comment_id=stored["id"]) if thumbnail else None
                     return jsonify(stored), 201
+            if connection.execute("SELECT 1 FROM comments WHERE review_id = ? AND owner_hash = ? AND kind = 'review_complete'", (review_id, owner)).fetchone():
+                abort(409, "请先撤销完成，再继续评论。")
             if parent_id is not None:
                 parent = connection.execute(
                     "SELECT 1 FROM comments WHERE id = ? AND review_id = ? AND parent_id IS NULL AND deleted = 0",
@@ -1290,6 +1609,8 @@ def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None
                 ).fetchone()
                 if parent is None:
                     abort(400, "找不到这条评审中的父评论。")
+            if not anonymous:
+                save_profile(connection, identity, author)
             result = connection.execute(
                 "INSERT INTO comments (review_id, parent_id, author, body, anchor, created_at, owner_hash) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (review_id, parent_id, author, body, json.dumps(anchor), created_at, owner),
@@ -1360,6 +1681,7 @@ def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None
 
     @app.get("/media/<review_id>/attachments/<attachment_id>")
     def review_attachment(review_id, attachment_id):
+        read_review(review_id)
         if not SHARE_ID.fullmatch(review_id) or not SHARE_ID.fullmatch(attachment_id):
             abort(404, "图片附件不存在。")
         with closing(connect()) as connection:
@@ -1371,6 +1693,18 @@ def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None
         if attachment is None or not path.is_file():
             abort(404, "图片附件不存在。")
         return send_file(path, mimetype=attachment["mimetype"], download_name=attachment["name"])
+
+    @app.get("/media/<review_id>/preview")
+    def review_html_preview(review_id):
+        row = read_review(review_id)
+        if row["type"] != "html":
+            abort(404)
+        path = media_dir / review_id
+        if not path.is_file():
+            abort(404, "原文件不存在。")
+        response = Response(path.read_text(encoding="utf-8-sig") + HTML_BRIDGE, mimetype="text/html")
+        response.headers["Content-Security-Policy"] = HTML_CSP
+        return response
 
     @app.get("/media/<review_id>")
     def review_media(review_id):
@@ -1390,6 +1724,60 @@ def create_app(data_dir, lan_ip=None, lan_cidr=None, port=8765, owner_token=None
     return app
 
 
+def public_gateway(app, public_origin, data_dir, legacy_token=None, legacy_review=None):
+    host = urlsplit(public_origin).hostname.lower()
+    database = Path(data_dir).expanduser().resolve() / "reviews.sqlite3"
+    review_pattern = r"[A-Za-z0-9_-]{32}"
+    static_pattern = r"/static/(?:style\.css|code-highlight\.css|app\.js|media-time\.js|folder-paths\.js|favicon\.svg|katex/(?:katex\.min\.(?:css|js)|fonts/[A-Za-z0-9_.-]+))"
+    read_pattern = re.compile(r"^/(?:review/(?P<page>" + review_pattern + r")|api/reviews/(?P<api>" + review_pattern + r")(?:/rendered|/comments/[0-9]+/thumbnail)?|media/(?P<media>" + review_pattern + r")(?:/preview|/attachments/" + review_pattern + r")?)$")
+    write_pattern = re.compile(r"^/api/reviews/(" + review_pattern + r")/(?:comments(?:/[0-9]+/delete)?|presence|complete|uncomplete|participants)$")
+    def gateway(environ, start_response):
+        def reject(status, body=b"Not found"):
+            start_response(status, [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body))), ("Cache-Control", "no-store")])
+            return [body]
+        if environ.get("REMOTE_ADDR") not in ("127.0.0.1", "::1") or environ.get("HTTP_HOST", "").lower() not in (host, host + ":443"):
+            return reject("403 Forbidden", b"Forbidden")
+        path, method = environ.get("PATH_INFO", ""), environ.get("REQUEST_METHOD", "")
+        if method == "GET" and legacy_token and secrets.compare_digest(path, "/access/" + legacy_token):
+            start_response("302 Found", [("Location", "/review/" + legacy_review), ("Content-Length", "0"), ("Referrer-Policy", "no-referrer")])
+            return [b""]
+        rid = None
+        if method in ("GET", "HEAD"):
+            if re.fullmatch(static_pattern, path):
+                pass
+            else:
+                match = read_pattern.fullmatch(path)
+                if not match:
+                    return reject("404 Not Found")
+                rid = match.group("page") or match.group("api") or match.group("media")
+        elif method == "POST":
+            if environ.get("HTTP_ORIGIN") != public_origin or environ.get("HTTP_SEC_FETCH_SITE") == "cross-site":
+                return reject("403 Forbidden", b"Forbidden")
+            try:
+                length = int(environ.get("CONTENT_LENGTH") or "0")
+            except ValueError:
+                return reject("400 Bad Request")
+            if length < 0 or length > 262144:
+                return reject("413 Payload Too Large")
+            match = write_pattern.fullmatch(path)
+            if not match:
+                return reject("404 Not Found")
+            rid = match.group(1)
+        else:
+            return reject("404 Not Found")
+        if rid:
+            with closing(sqlite3.connect(database, timeout=15)) as db:
+                found = db.execute("SELECT 1 FROM public_reviews p JOIN reviews r ON r.id=p.review_id WHERE p.review_id=? AND r.type NOT IN ('video', 'audio') AND NOT EXISTS (SELECT 1 FROM removed_reviews d WHERE d.review_id=p.review_id)", (rid,)).fetchone()
+            if not found:
+                return reject("404 Not Found")
+        environ["wsgi.url_scheme"] = "https"
+        environ["HTTP_HOST"] = host
+        environ["SERVER_PORT"] = "443"
+        environ["lanreview.public"] = True
+        return app(environ, start_response)
+    return gateway
+
+
 def main():
     parser = argparse.ArgumentParser(description="本机与局域网文件评审")
     data_home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
@@ -1397,10 +1785,12 @@ def main():
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--lan-ip", help="分享链接使用的本机私有 IPv4 地址")
     parser.add_argument("--lan-cidr", help="允许访问的私有 IPv4 网段，如 192.168.1.0/24")
+    parser.add_argument("--public-origin", help="外链 HTTPS 来源")
+    parser.add_argument("--public-port", type=int, default=18891, help="外链网关本机端口")
     args = parser.parse_args()
 
     try:
-        app = create_app(args.data_dir, args.lan_ip, args.lan_cidr, args.port)
+        app = create_app(args.data_dir, args.lan_ip, args.lan_cidr, args.port, public_origin=args.public_origin)
     except ValueError as error:
         parser.error(str(error))
     bind = "0.0.0.0" if args.lan_ip else "127.0.0.1"
@@ -1408,11 +1798,25 @@ def main():
     print(f"本机访问地址 http://127.0.0.1:{args.port}/", flush=True)
     if args.lan_ip:
         print(f"局域网分享地址 http://{args.lan_ip}:{args.port}（允许 {args.lan_cidr}）", flush=True)
+    public_server = None
+    if args.public_origin:
+        try:
+            legacy_token = os.environ.get("LANREVIEW_LEGACY_TOKEN")
+            legacy_review = os.environ.get("LANREVIEW_LEGACY_REVIEW")
+            public_server = make_server("127.0.0.1", args.public_port, public_gateway(app, args.public_origin.rstrip("/"), args.data_dir, legacy_token, legacy_review), threaded=True)
+        except Exception:
+            server.server_close()
+            raise
+        threading.Thread(target=public_server.serve_forever, daemon=True).start()
+        print(f"外链网关 127.0.0.1:{args.public_port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        if public_server:
+            public_server.shutdown()
+            public_server.server_close()
         server.server_close()
 
 

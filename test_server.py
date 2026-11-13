@@ -5,6 +5,7 @@ from io import BytesIO
 from pathlib import Path
 import sqlite3
 import re
+from html import unescape
 from tempfile import TemporaryDirectory
 import unittest
 import shutil
@@ -14,7 +15,7 @@ from unittest.mock import patch
 from werkzeug.datastructures import MultiDict
 from PIL import Image
 
-from server import HTML_BRIDGE, create_app, persistent_owner_token
+from server import HTML_BRIDGE, create_app, persistent_owner_token, render_markdown, public_gateway
 
 
 OWNER = {"Authorization": "Bearer local-test-token"}
@@ -25,6 +26,45 @@ PNG = b64decode(PNG_BASE64)
 
 
 class ServerTest(unittest.TestCase):
+    def test_rich_markdown_features_and_safe_fenced_code(self):
+        source = ("# 标题\n\n- [ ] 待办\n- [x] 完成\n\n"
+                  "~~删除线~~ ==高亮==\n\n| 列一 | 列二 |\n| --- | --- |\n| 甲 | 乙 |\n\n"
+                  "```python\ndef add(x):\n    return x + 1\n```\n\n脚注[^参考]\n\n[^参考]: 注释内容")
+        html, _ = render_markdown(source, {})
+        for fragment in ('<h1 ', '<input disabled type="checkbox">', '<input checked disabled type="checkbox">',
+                         '<del>删除线</del>', '<mark>高亮</mark>', '<table>', '<div class="highlight">',
+                         '<span class="k">def</span>', 'id="fn:参考"', 'href="#fn:参考"'):
+            self.assertIn(fragment, html)
+        self.assertNotIn('<script', html)
+
+    def test_nested_code_does_not_import_fake_image_references(self):
+        from server import markdown_local_images
+        source = "- 例子\n\n    ```markdown\n    ![不导入](fake.png)\n    ```\n\n![实际](real.png)"
+        self.assertEqual(markdown_local_images(source), [("real.png", "real.png")])
+
+    def test_math_common_delimiters_and_plain_currency(self):
+        source = (r"行内 $x_i$ 和 \(x^2\)" + "\n\n" + r"$$\frac{1}{2}$$" + "\n\n"
+                  + r"\[\sum_{i=1}^n i\]" + "\n\n" + r"\begin{align}" + "\n"
+                  + r"a &= b \\" + "\n" + r"c &= d" + "\n" + r"\end{align}"
+                  + "\n\n" + "价格 $2 和 $10。")
+        html, _ = render_markdown(source, {})
+        self.assertEqual(html.count('class="arithmatex"'), 5)
+        self.assertIn(r"\frac{1}{2}", html)
+        self.assertIn(r"\sum_{i=1}^n i", html)
+        self.assertIn(r"\begin{align}", html)
+        self.assertIn("价格 $2 和 $10。", html)
+
+    def test_math_markdown_preserves_latex_and_ignores_code(self):
+        source = r"公式 $x_i$ 与 \(y^2\)，代码 `$z$`。" + "\n\n" + r"$$\begin{cases}" + "\n" + r"x &= 1 \\" + "\n" + r"y &= 2" + "\n" + r"\end{cases}$$" + "\n\n```\n$x$\n```"
+        html, _ = render_markdown(source, {})
+        self.assertIn('<span class="arithmatex">\\(x_i\\)</span>', html)
+        self.assertIn('<span class="arithmatex">\\(y^2\\)</span>', html)
+        self.assertIn('<div class="arithmatex">', html)
+        self.assertIn(r"\begin{cases}", html)
+        self.assertIn('<code>$z$</code>', html)
+        self.assertIn('$x$', html)
+        self.assertNotIn('class="arithmatex">\\(z', html)
+
     @unittest.skipUnless(shutil.which("node"), "Node is needed to exercise the HTML bridge")
     def test_html_bridge_selection_visibility_clips_nested_scroll_and_ignores_stale(self):
         harness = r'''
@@ -212,6 +252,309 @@ assert.strictEqual(messages.at(-1).quote,'Beta');
                 base_url=LAN_ORIGIN, environ_overrides=LAN,
                 headers={"Idempotency-Key": key} if key is not None else {},
             )
+
+    def test_delete_review_preserves_files_comments_and_other_reviews(self):
+        image = b"\x89PNG\r\n\x1a\n" + b"image"
+        rid = self.upload("delete.md", b"# review", (("picture.png", image),))
+        other = self.upload("keep.md")
+        parent = self.comment(rid).json
+        self.comment(rid, parent_id=parent["id"])
+        directory = Path(self.directory.name)
+        with sqlite3.connect(directory / "reviews.sqlite3") as db:
+            attachment_ids = [r[0] for r in db.execute("SELECT id FROM review_attachments WHERE review_id = ?", (rid,))]
+        self.assertEqual(len(attachment_ids), 1)
+        result = self.client.post(f"/api/reviews/{rid}/delete", base_url=LAN_ORIGIN, environ_overrides=LAN,
+                                  headers={"Origin": "http://evil.example"})
+        self.assertEqual(result.status_code, 403)
+        self.assertEqual(self.guest(f"/api/reviews/{rid}").status_code, 200)
+        result = self.client.post(f"/api/reviews/{rid}/delete", base_url=LAN_ORIGIN, environ_overrides=LAN)
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(self.guest(f"/api/reviews/{rid}").status_code, 404)
+        self.assertEqual(self.guest(f"/media/{rid}").status_code, 404)
+        self.assertEqual(self.guest(f"/media/{rid}/attachments/{attachment_ids[0]}").status_code, 404)
+        self.assertEqual(self.guest(f"/api/reviews/{other}").status_code, 200)
+        self.assertTrue((directory / "files" / rid).exists())
+        self.assertTrue((directory / "files" / f"attachment-{attachment_ids[0]}").exists())
+        with sqlite3.connect(directory / "reviews.sqlite3") as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM comments WHERE review_id = ?", (rid,)).fetchone()[0], 2)
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+        self.assertEqual(self.client.post(f"/api/reviews/{rid}/delete").status_code, 404)
+
+    def test_deleted_visual_comment_has_no_exposed_anchor(self):
+        for filename, payload, anchor in (("scene.png", PNG, {"type": "image", "x": .3, "y": .5}), ("scene.mp4", b"video", {"type": "video", "time": 3.5, "region": {"type": "point", "x": .2, "y": .6}})):
+            with self.subTest(filename=filename):
+                rid = self.upload(filename, payload)
+                owner = self.app.test_client()
+                path = f"/api/reviews/{rid}"
+                created = owner.post(path + "/comments", json={"body": "待删除", "anchor": anchor})
+                self.assertEqual(created.status_code, 201)
+                self.assertEqual(owner.post(path + f"/comments/{created.json['id']}/delete").status_code, 200)
+                result = owner.get(path).json["comments"][0]
+                self.assertTrue(result["deleted"])
+                self.assertIsNone(result["anchor"])
+                self.assertIsNone(result["thumbnail_url"])
+
+    def test_review_completion_is_idempotent_and_visible_to_others(self):
+        rid = self.upload("review.md")
+        first = self.app.test_client()
+        second = self.app.test_client()
+        self.assertEqual(first.post(f"/api/reviews/{rid}/complete").status_code, 200)
+        self.assertEqual(first.post(f"/api/reviews/{rid}/complete").status_code, 200)
+        own = first.get(f"/api/reviews/{rid}").json
+        other = second.get(f"/api/reviews/{rid}").json
+        self.assertTrue(own["completed_by_me"])
+        self.assertFalse(other["completed_by_me"])
+        self.assertEqual(len(own["comments"]), 1)
+        self.assertEqual(own["comments"][0]["kind"], "review_complete")
+        self.assertTrue(own["comments"][0]["is_mine"])
+        self.assertFalse(other["comments"][0]["is_mine"])
+        self.assertEqual(second.post(f"/api/reviews/{rid}/complete").status_code, 200)
+        self.assertEqual(len(first.get(f"/api/reviews/{rid}").json["comments"]), 2)
+        self.assertEqual(first.post(f"/api/reviews/{rid}/complete", headers={"Origin": "https://evil.example"}).status_code, 403)
+
+    def test_participant_progress_and_claims(self):
+        rid = self.upload("roster.md")
+        path = f"/api/reviews/{rid}"
+        alice = self.app.test_client()
+        bob = self.app.test_client()
+        self.assertEqual(alice.post(path + "/participants", json={"names": ["小王", "小李"]}).status_code, 200)
+        data = alice.get(path).json
+        first, second = data["participants"]
+        self.assertFalse(any(p["completed"] for p in data["participants"]))
+        self.assertEqual(alice.post(path + "/complete", json={}).status_code, 400)
+        self.assertEqual(alice.post(path + "/complete", json={"participant_id": first["id"]}).status_code, 200)
+        self.assertEqual(bob.post(path + "/complete", json={"participant_id": first["id"]}).status_code, 409)
+        progress = bob.get(path).json["participants"]
+        self.assertEqual([p["completed"] for p in progress], [True, False])
+        self.assertEqual(bob.post(path + "/complete", json={"participant_id": second["id"]}).status_code, 200)
+        self.assertTrue(all(p["completed"] for p in alice.get(path).json["participants"]))
+        self.assertEqual(alice.post(path + "/participants", json={"names": ["小王", "小李", "小赵"]}).status_code, 200)
+        self.assertEqual([p["completed"] for p in alice.get(path).json["participants"]], [True, True, False])
+        self.assertEqual(alice.post(path + "/participants", json={"names": ["小王", "小王"]}).status_code, 400)
+        self.assertEqual(alice.post(path + "/participants", json={"names": []}).status_code, 200)
+        self.assertEqual(alice.get(path).json["participants"], [])
+
+    def test_uncomplete_preserves_identity_and_history(self):
+        rid = self.upload("undo.md")
+        path = f"/api/reviews/{rid}"
+        alice, bob = self.app.test_client(), self.app.test_client()
+        alice.post(path + "/participants", json={"names": ["小王", "小李"]})
+        people = alice.get(path).json["participants"]
+        alice.post(path + "/complete", json={"participant_id": people[0]["id"]})
+        bob.post(path + "/complete", json={"participant_id": people[1]["id"]})
+        self.assertEqual(alice.post(path + "/uncomplete").status_code, 200)
+        self.assertEqual(alice.post(path + "/uncomplete").status_code, 200)
+        result = alice.get(path).json
+        self.assertEqual([p["completed"] for p in result["participants"]], [False, True])
+        self.assertTrue(result["participants"][0]["is_mine"])
+        self.assertTrue(result["participants"][0]["claimed"])
+        self.assertFalse(result["completed_by_me"])
+        self.assertEqual([c["kind"] for c in result["comments"]], ["review_complete_history", "review_complete", "review_uncomplete"])
+        self.assertEqual(bob.post(path + "/complete", json={"participant_id": people[0]["id"]}).status_code, 200) # already completed as Bob
+        third = self.app.test_client()
+        self.assertEqual(third.post(path + "/complete", json={"participant_id": people[0]["id"]}).status_code, 409)
+        alice.post(path + "/complete", json={})
+        self.assertTrue(all(p["completed"] for p in bob.get(path).json["participants"]))
+        self.assertEqual(len(alice.get(path).json["comments"]), 4)
+        self.assertEqual(alice.post(path + "/uncomplete", headers={"Origin": "https://evil.example"}).status_code, 403)
+
+    def test_uncomplete_without_roster(self):
+        rid = self.upload("undo-no-roster.md")
+        path = f"/api/reviews/{rid}"
+        self.client.post(path + "/complete")
+        self.client.post(path + "/uncomplete")
+        result = self.client.get(path).json
+        self.assertFalse(result["completed_by_me"])
+        self.assertEqual([c["kind"] for c in result["comments"]], ["review_complete_history", "review_uncomplete"])
+        self.client.post(path + "/complete")
+        self.assertTrue(self.client.get(path).json["completed_by_me"])
+
+    def test_completed_reviewer_must_reopen_before_commenting(self):
+        rid = self.upload("finish-lock.md")
+        path = f"/api/reviews/{rid}"
+        first, second = self.app.test_client(), self.app.test_client()
+        first.post(path + "/complete")
+        self.assertEqual(first.post(path + "/comments", json={"body": "新意见"}).status_code, 409)
+        self.assertEqual(second.post(path + "/comments", json={"body": "其他人仍可评论"}).status_code, 201)
+        first.post(path + "/uncomplete")
+        self.assertEqual(first.post(path + "/comments", json={"body": "继续评论"}).status_code, 201)
+
+    def test_audio_time_anchors(self):
+        rid = self.upload("sound.wav", b"RIFF-test")
+        response = self.comment(rid, anchor={"type": "audio", "time": 1, "end_time": 2})
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json["anchor"]["end_time"], 2)
+        invalid = self.comment(rid, anchor={"type": "audio", "time": 2, "end_time": 1})
+        self.assertEqual(invalid.status_code, 400)
+        wrong = self.comment(rid, anchor={"type": "video", "time": 1})
+        self.assertEqual(wrong.status_code, 400)
+
+    def test_clear_reviews_only_removes_requested_snapshot(self):
+        first = self.upload("first.md")
+        second = self.upload("second.md")
+        later = self.upload("later.md")
+        self.comment(first)
+        result = self.client.post("/api/reviews/clear", json={"ids": [first, second]}, base_url=LAN_ORIGIN, environ_overrides=LAN)
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json["deleted"], 2)
+        self.assertEqual(self.guest(f"/api/reviews/{first}").status_code, 404)
+        self.assertEqual(self.guest(f"/api/reviews/{later}").status_code, 200)
+        self.assertTrue((Path(self.directory.name) / "files" / first).exists())
+        with sqlite3.connect(Path(self.directory.name) / "reviews.sqlite3") as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM comments WHERE review_id = ?", (first,)).fetchone()[0], 1)
+        self.assertEqual(self.client.post("/api/reviews/clear", json={"ids": [later, "bad"]}).status_code, 400)
+        self.assertEqual(self.guest(f"/api/reviews/{later}").status_code, 200)
+
+    def test_cleanup_only_expired_removed_remote_reviews(self):
+        from cleanup_reviews import cleanup
+        from datetime import datetime, timedelta, timezone
+        def remote_upload(name):
+            result = self.client.post("/api/reviews", data={"file": (BytesIO(b"# remote"), name)},
+                                      base_url=LAN_ORIGIN, environ_overrides=LAN)
+            self.assertEqual(result.status_code, 201)
+            return result.json["id"]
+        expired = remote_upload("expired.md")
+        recent = remote_upload("recent.md")
+        active = remote_upload("active.md")
+        unknown = remote_upload("unknown.md")
+        local = self.upload("local.md")
+        self.comment(expired)
+        for rid in (expired, recent, unknown, local):
+            self.assertEqual(self.client.post(f"/api/reviews/{rid}/delete").status_code, 200)
+        now = datetime.now(timezone.utc)
+        old = (now - timedelta(days=31)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        with sqlite3.connect(Path(self.directory.name) / "reviews.sqlite3") as db:
+            db.execute("UPDATE removed_reviews SET removed_at = ? WHERE review_id IN (?, ?, ?)", (old, expired, unknown, local))
+            db.execute("DELETE FROM review_origins WHERE review_id = ?", (unknown,))
+        self.assertEqual(cleanup(self.directory.name, now), (1, 0))
+        with sqlite3.connect(Path(self.directory.name) / "reviews.sqlite3") as db:
+            ids = {row[0] for row in db.execute("SELECT id FROM reviews")}
+            self.assertEqual(ids, {recent, active, unknown, local})
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM comments WHERE review_id = ?", (expired,)).fetchone()[0], 0)
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+        self.assertFalse((Path(self.directory.name) / "files" / expired).exists())
+        for rid in (recent, active, unknown, local):
+            self.assertTrue((Path(self.directory.name) / "files" / rid).exists())
+
+    def test_upload_cancellation_and_completed_race(self):
+        token = self.client.post("/api/uploads").json["id"]
+        self.assertEqual(self.client.post(f"/api/uploads/{token}/cancel").json["state"], "cancelled")
+        result = self.client.post("/api/reviews", data={"file": (BytesIO(b"# cancel"), "cancel.md")}, headers={"X-Upload-Id": token})
+        self.assertEqual(result.status_code, 409)
+        self.assertEqual(self.client.get("/api/reviews").json["reviews"], [])
+        token = self.client.post("/api/uploads").json["id"]
+        result = self.client.post("/api/reviews", data={"file": (BytesIO(b"# ok"), "ok.md")}, headers={"X-Upload-Id": token})
+        self.assertEqual(result.status_code, 201)
+        self.assertEqual(self.client.post(f"/api/uploads/{token}/cancel").json["state"], "completed")
+        self.assertEqual(len(self.client.get("/api/reviews").json["reviews"]), 1)
+        self.assertEqual(self.client.post("/api/uploads/missing/cancel").status_code, 404)
+
+    def test_initiator_matches_browser_anonymous_comment_and_legacy(self):
+        first = self.upload("first.md")
+        second = self.upload("second.md")
+        with self.app.test_client() as another:
+            result = another.post("/api/reviews", data={"file": (BytesIO(b"# other"), "other.md")})
+            other = result.json["id"]
+            comment = another.post(f"/api/reviews/{other}/comments", json={"body": "hello"}).json
+        listing = {r["id"]: r for r in self.client.get("/api/reviews").json["reviews"]}
+        self.assertRegex(listing[first]["initiator"], r"^匿名-[0-9a-f]{10}$")
+        self.assertEqual(listing[first]["initiator"], listing[second]["initiator"])
+        self.assertNotEqual(listing[first]["initiator"], listing[other]["initiator"])
+        self.assertEqual(listing[other]["initiator"], comment["author"])
+        with sqlite3.connect(Path(self.directory.name) / "reviews.sqlite3") as db:
+            db.execute("UPDATE review_origins SET initiator = NULL WHERE review_id = ?", (first,))
+        self.assertEqual(self.client.get(f"/api/reviews/{first}").json["initiator"], "未记录")
+
+    def test_profile_updates_previous_reviews_and_comments(self):
+        a = self.app.test_client()
+        b = self.app.test_client()
+        def upload(client, name):
+            return client.post("/api/reviews", data={"file": (BytesIO(b"# x"), name)}).json["id"]
+        first, second, other = upload(a, "one.md"), upload(a, "two.md"), upload(b, "other.md")
+        old = a.post(f"/api/reviews/{first}/comments", json={"body": "old"}).json
+        stranger = b.post(f"/api/reviews/{first}/comments", json={"body": "stranger"}).json
+        self.assertTrue(old["author"].startswith("匿名-"))
+        named = a.post(f"/api/reviews/{second}/comments", json={"author": "小王", "body": "new"})
+        self.assertEqual(named.status_code, 201)
+        listing = {r["id"]:r for r in b.get("/api/reviews").json["reviews"]}
+        self.assertEqual(listing[first]["initiator"], "小王")
+        self.assertEqual(listing[second]["initiator"], "小王")
+        self.assertNotEqual(listing[other]["initiator"], "小王")
+        comments = b.get(f"/api/reviews/{first}").json["comments"]
+        self.assertEqual(comments[0]["author"], "小王")
+        self.assertEqual(comments[1]["author"], stranger["author"])
+        self.assertEqual(a.post('/api/profile', json={'name':'小李'}).status_code, 200)
+        self.assertEqual(b.get(f"/api/reviews/{first}").json["comments"][0]["author"], "小李")
+        self.assertEqual({r["id"]:r for r in b.get('/api/reviews').json['reviews']}[first]['initiator'], '小李')
+        self.assertEqual(a.post('/api/profile', json={'name':''}).status_code, 200)
+        self.assertEqual(b.get(f"/api/reviews/{first}").json["comments"][0]["author"], old['author'])
+        self.assertEqual(a.post('/api/profile', json={'name':'x'*65}).status_code, 400)
+
+    def test_presence_counts_browsers_per_review_and_expires(self):
+        first = self.upload("first.md")
+        second = self.upload("second.md")
+        one, two = self.app.test_client(), self.app.test_client()
+        with patch("server.time.monotonic", return_value=1000):
+            self.assertEqual(one.post(f"/api/reviews/{first}/presence").json["count"], 1)
+            self.assertEqual(one.post(f"/api/reviews/{first}/presence").json["count"], 1)
+            self.assertEqual(two.post(f"/api/reviews/{first}/presence").json["count"], 2)
+            self.assertEqual(two.post(f"/api/reviews/{second}/presence").json["count"], 1)
+        with patch("server.time.monotonic", return_value=1091):
+            self.assertEqual(one.post(f"/api/reviews/{first}/presence").json["count"], 1)
+        self.assertEqual(one.post("/api/reviews/"+"a"*32+"/presence").status_code, 404)
+        self.assertEqual(one.post(f"/api/reviews/{first}/presence", headers={"Origin":"http://evil.example"}).status_code, 403)
+
+    def test_presence_scope_uses_connection_not_forwarded_headers(self):
+        rid = self.upload("scope.md")
+        local, lan = self.app.test_client(), self.app.test_client()
+        local_response = local.post(f"/api/reviews/{rid}/presence", headers={"X-Forwarded-For": "8.8.8.8"})
+        self.assertEqual(local_response.json, {"count": 1, "lan": 0, "local_or_proxy": 1})
+        lan_response = lan.post(f"/api/reviews/{rid}/presence", base_url=LAN_ORIGIN, environ_overrides=LAN,
+                                headers={"X-Forwarded-For": "8.8.8.8"})
+        self.assertEqual(lan_response.json, {"count": 2, "lan": 1, "local_or_proxy": 1})
+        self.assertEqual(lan.post(f"/api/reviews/{rid}/presence", base_url=LAN_ORIGIN,
+                                  environ_overrides={"REMOTE_ADDR":"8.8.8.8"}).status_code, 403)
+
+    def test_public_gateway_only_published_reviews_and_lan_management(self):
+        from werkzeug.test import Client
+        from werkzeug.wrappers import Response
+        origin = "https://example.test"
+        app = create_app(self.directory.name, "192.168.51.158", "192.168.50.0/23", public_origin=origin)
+        app.testing = True
+        local = app.test_client()
+        def upload(name):
+            return local.post("/api/reviews", data={"file": (BytesIO(b"# test"), name)}).json["id"]
+        shared, private = upload("share.md"), upload("private.md")
+        gateway = Client(public_gateway(app, origin, self.directory.name), Response)
+        def get(path): return gateway.get(path, base_url=origin, environ_overrides={"REMOTE_ADDR":"127.0.0.1"}, buffered=True)
+        self.assertEqual(get('/review/'+shared).status_code, 404)
+        lan = app.test_client()
+        lan_env = {"REMOTE_ADDR": "192.168.51.42"}
+        self.assertFalse(lan.get('/api/reviews', base_url=LAN_ORIGIN, environ_overrides=lan_env).json['can_create_public_link'])
+        self.assertEqual(lan.post('/api/reviews/'+shared+'/public-link', base_url=LAN_ORIGIN, environ_overrides=lan_env).status_code, 403)
+        host_env = {"REMOTE_ADDR": "192.168.51.158"}
+        self.assertTrue(lan.get('/api/reviews', base_url=LAN_ORIGIN, environ_overrides=host_env).json['can_create_public_link'])
+        self.assertTrue(local.get('/api/reviews').json['can_create_public_link'])
+        with patch('server.urlopen') as check:
+            check.return_value.__enter__.return_value.status = 200
+            created = local.post('/api/reviews/'+shared+'/public-link')
+        self.assertEqual(created.json['url'], origin+'/review/'+shared)
+        self.assertEqual(get('/review/'+shared).status_code, 200)
+        self.assertEqual(get('/api/reviews/'+shared).json['url'], origin+'/review/'+shared)
+        self.assertEqual(get('/api/reviews/'+private).status_code, 404)
+        self.assertEqual(get('/api/reviews').status_code, 404)
+        self.assertEqual(get('/static/katex/katex.min.js').status_code, 200)
+        self.assertEqual(gateway.post('/api/reviews/import', base_url=origin, environ_overrides={"REMOTE_ADDR":"127.0.0.1"}, headers={"Origin":origin}, json={"path":"/etc/passwd"}).status_code, 404)
+        self.assertEqual(gateway.post('/api/profile', base_url=origin, environ_overrides={"REMOTE_ADDR":"127.0.0.1"}, headers={"Origin":origin}, json={"name":"x"}).status_code, 404)
+        self.assertEqual(gateway.post('/api/reviews/'+shared+'/comments', base_url=origin, environ_overrides={"REMOTE_ADDR":"127.0.0.1"}, headers={"Origin":"https://bad.test"}, json={"body":"hello"}).status_code, 403)
+        comment = gateway.post('/api/reviews/'+shared+'/comments', base_url=origin, environ_overrides={"REMOTE_ADDR":"127.0.0.1"}, headers={"Origin":origin}, json={"body":"hello"})
+        self.assertEqual(comment.status_code, 201)
+        self.assertEqual(local.get('/api/reviews/'+shared).json['comments'][0]['body'], 'hello')
+        self.assertEqual(gateway.get('/review/'+shared, base_url=origin, environ_overrides={"REMOTE_ADDR":"192.168.50.1"}).status_code, 403)
+        self.assertEqual(local.post('/api/reviews/'+shared+'/delete').status_code, 200)
+        self.assertEqual(get('/review/'+shared).status_code, 404)
+        video = local.post('/api/reviews', data={"file":(BytesIO(b"video"),"x.mp4")}).json['id']
+        self.assertEqual(local.post('/api/reviews/'+video+'/public-link').status_code, 415)
 
     def test_shared_access_and_network_boundaries(self):
         review_id = self.upload("../../片段.md")
@@ -466,7 +809,7 @@ assert.strictEqual(messages.at(-1).quote,'Beta');
         self.assertTrue(comments[0]["deleted"])
         self.assertEqual(comments[0]["author"], "评论已删除")
         self.assertEqual(comments[0]["body"], "")
-        self.assertEqual(comments[0]["anchor"], parent["anchor"])
+        self.assertIsNone(comments[0]["anchor"])
         self.assertFalse(comments[0]["can_delete"])
         self.assertEqual(comments[1]["id"], reply["id"])
         self.assertEqual(comments[1]["body"], "保留回复")
@@ -680,7 +1023,9 @@ assert.strictEqual(messages.at(-1).quote,'Beta');
         self.assertIn('<input disabled type="checkbox"> Pending', result)
         self.assertIn('<input checked disabled type="checkbox"> Done', result)
         self.assertIn('<h1 id="notes">Notes</h1>', result)
-        self.assertIn("&lt;a&gt;", result)
+        code = re.search(r"<pre>.*?</pre>", result, re.S).group()
+        self.assertEqual(unescape(re.sub(r"<[^>]+>", "", code)).strip(), "<a>")
+        self.assertNotIn("<a>", code)
         self.assertIn("&lt;img", result)
         self.assertIn('href="https://example.invalid" rel="noopener noreferrer" target="_blank"', result)
         self.assertNotIn("https://example.invalid/pixel", result)
@@ -694,6 +1039,11 @@ assert.strictEqual(messages.at(-1).quote,'Beta');
         self.assertIn(b"lanreview:selection", response.data)
         self.assertIn("sandbox allow-scripts;", response.headers["Content-Security-Policy"])
         self.assertIn("default-src 'none'", response.headers["Content-Security-Policy"])
+        preview = self.guest(media_url + "/preview")
+        self.assertEqual(preview.status_code, 200)
+        self.assertIn(b"lanreview:selection", preview.data)
+        self.assertIn("sandbox allow-scripts;", preview.headers["Content-Security-Policy"])
+        self.assertEqual(self.guest(f"/media/{review_id}/preview/missing").status_code, 404)
         download = self.guest(media_url, headers={"Sec-Fetch-Dest": "document"})
         self.assertIn("attachment", download.headers["Content-Disposition"])
         self.assertNotIn(b"lanreview:selection", download.data)
